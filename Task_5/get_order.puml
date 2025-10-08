@@ -1,0 +1,36 @@
+@startuml
+title Карточка заказа: чтение и обновление (no-cache, ETag/304)
+
+actor Client
+participant other_service as other_service
+participant "MES_API" as API
+participant "MES_CACHE (Redis)" as Cache
+participant "MES_DB" as DB
+
+== Чтение карточки ==
+Client -> API: GET /orders/{id}\nCache-Control: no-cache\nIf-None-Match: <ClientETag>
+API -> Cache: GET order:{id}
+alt cache HIT (TTL валиден)
+  Cache --> API: {orderData, orderETag}
+  API -> API: compare(ClientETag, orderETag)
+  alt ETag совпал
+    API --> Client: 304 Not Modified\nCache-Control: no-cache
+  else
+    API --> Client: 200 OK\nCache-Control: no-cache\nETag: orderETag\nBody: orderData
+  end
+else MISS или TTL истёк
+  Cache --> API: MISS/expired
+  API -> DB: SELECT * FROM orders WHERE id={id}
+  DB --> API: row
+  API -> API: compute orderETag
+  API -> Cache: SET order:{id} = {orderData, orderETag} (TTL)
+  API --> Client: 200 OK\nCache-Control: no-cache\nETag: orderETag\nBody: orderData
+end
+
+== Обновление статуса заказа с инвалидацией в кэше ==
+other_service -> API: PATCH /orders/{id}/status=...
+API -> DB: UPDATE orders SET status=... WHERE id={id}
+DB --> API: OK
+API -> Cache: DEL order:{id}    # инвалидируем карточку в кэше
+API --> other_service: 200 OK
+@enduml

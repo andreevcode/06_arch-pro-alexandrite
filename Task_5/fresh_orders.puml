@@ -1,0 +1,46 @@
+@startuml
+title Новые заказы: чтение и async refresh через очередь (no-cache, ETag/304)
+
+actor Client
+participant other_service as other_service
+participant "MES_API" as API
+participant "MES_CACHE (Redis)" as Cache
+participant "MES_DB" as DB
+queue "Queue: orders-to-refresh" as Q
+participant "Async worker" as W
+
+== Чтение списка ==
+Client -> API: GET /orders/new?page=1\nCache-Control: no-cache\nIf-None-Match: <ClientETag>
+API -> Cache: GET page:new:1
+alt cache HIT (TTL валиден)
+  Cache --> API: {pageData, pageETag}
+  API -> API: compare(ClientETag, pageETag)
+  alt ETag совпал
+    API --> Client: 304 Not Modified\nCache-Control: no-cache
+  else
+    API --> Client: 200 OK\nCache-Control: no-cache\nETag: pageETag\nBody: pageData
+  end
+else MISS или TTL истёк
+  Cache --> API: MISS/expired
+  API -> DB: SELECT rows for page 1
+  DB --> API: rows
+  API -> API: compute pageETag
+  API -> Cache: SET page:new:1 = {pageData, pageETag} (TTL)
+  API --> Client: 200 OK\nCache-Control: no-cache\nETag: pageETag\nBody: pageData
+end
+
+== Изменение статуса заказа с отправкой в очередь для Refresh-Ahead обновления в кэше ==
+other_service -> API: PATCH /orders/{id}/status=...
+API -> DB: UPDATE orders SET status=... WHERE id={id}
+DB --> API: OK
+API -> Q: ENQUEUE orderId...   # orders для async обновления списка заказов в кэше
+API --> other_service: 200 OK
+
+== Асинхронное обновление изменившихся заказов в списке заказов в кэше ==
+W -> Q: PULL batch orderId...
+W -> DB: SELECT rows where orderId in {ids}
+DB --> W: rows
+W -> W: compute pageETag(n)
+W -> Cache: SET page:new:n = {pageData, pageETag(n)} (TTL)
+
+@enduml
